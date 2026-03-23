@@ -1,0 +1,2 @@
+# MasterThesis_GPU_Acceleration_for_Inductive_Logic_Rule_Mining_in_Graphs
+Repo for my master thesis
