@@ -19,7 +19,6 @@ Most files are under `MasterThesis/`:
 - `GPU_01/`, `GPU_02/`, `GPU_03/` - CUDA variants
 - `ScalaMeasuring/` - Scala benchmark code
 - `test_data/` - rule files and dataset placeholders
-- `*_MODEL_INFO.txt` - implementation notes
 
 ## Data
 
