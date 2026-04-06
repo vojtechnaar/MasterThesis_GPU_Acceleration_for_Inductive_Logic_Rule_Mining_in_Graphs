@@ -3,9 +3,13 @@
 #include "SupportCounting.hpp"
 #include "RuleParser.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <iostream>
+#include <map>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -67,7 +71,7 @@ int main(int argc, char* argv[]) {
 
         auto rulesStart = std::chrono::high_resolution_clock::now();
 
-        RuleParser parser(indexes);
+        RuleParser parser(indexes, ttlFile);
         std::vector<FinalRule> rules = parser.parseRuleFile(rulesFile);
 
         auto rulesEnd = std::chrono::high_resolution_clock::now();
@@ -80,6 +84,9 @@ int main(int argc, char* argv[]) {
         SupportCounting counter(indexes);
 
         long long sumRuleMs = 0;
+        std::vector<long long> ruleTimes;
+        std::map<int, std::vector<long long>> timesByBodySize;
+        ruleTimes.reserve(rules.size());
 
         for (std::size_t i = 0; i < rules.size(); ++i) {
             auto ruleStart = std::chrono::high_resolution_clock::now();
@@ -91,6 +98,8 @@ int main(int argc, char* argv[]) {
                 std::chrono::duration_cast<std::chrono::milliseconds>(ruleEnd - ruleStart).count();
 
             sumRuleMs += ruleMs;
+            ruleTimes.push_back(ruleMs);
+            timesByBodySize[static_cast<int>(rules[i].body.size())].push_back(ruleMs);
 
             std::cout << "\nRule " << (i + 1) << ": ";
             printRule(rules[i], indexes);
@@ -111,12 +120,63 @@ int main(int argc, char* argv[]) {
 
         double avgRuleMs = rules.empty() ? 0.0 : static_cast<double>(sumRuleMs) / static_cast<double>(rules.size());
 
+        // Compute detailed statistics
+        std::sort(ruleTimes.begin(), ruleTimes.end());
+        long long minMs = ruleTimes.empty() ? 0 : ruleTimes.front();
+        long long maxMs = ruleTimes.empty() ? 0 : ruleTimes.back();
+        long long medianMs = 0;
+        long long p95Ms = 0;
+        double stdDev = 0.0;
+
+        if (!ruleTimes.empty()) {
+            std::size_t n = ruleTimes.size();
+            medianMs = (n % 2 == 1) ? ruleTimes[n / 2]
+                                     : (ruleTimes[n / 2 - 1] + ruleTimes[n / 2]) / 2;
+            std::size_t p95Idx = static_cast<std::size_t>(std::ceil(0.95 * n)) - 1;
+            p95Ms = ruleTimes[std::min(p95Idx, n - 1)];
+
+            double sumSqDiff = 0.0;
+            for (auto t : ruleTimes) {
+                double diff = static_cast<double>(t) - avgRuleMs;
+                sumSqDiff += diff * diff;
+            }
+            stdDev = std::sqrt(sumSqDiff / static_cast<double>(n));
+        }
+
         std::cout << "\n=== Timing summary ===\n";
-        std::cout << "Indexing time: " << indexMs << " ms\n";
-        std::cout << "Rule parsing time: " << rulesMs << " ms\n";
-        std::cout << "Support counting time: " << supportMs << " ms\n";
-        std::cout << "Total time: " << totalMs << " ms\n";
-        std::cout << "Average time per rule: " << avgRuleMs << " ms\n";
+        std::cout << "Indexing time:          " << indexMs << " ms\n";
+        std::cout << "Rule parsing time:      " << rulesMs << " ms\n";
+        std::cout << "Support counting time:  " << supportMs << " ms\n";
+        std::cout << "Total time:             " << totalMs << " ms\n";
+        std::cout << "\n=== Per-rule statistics (" << ruleTimes.size() << " rules) ===\n";
+        std::cout << "Average: " << avgRuleMs << " ms\n";
+        std::cout << "Median:  " << medianMs << " ms\n";
+        std::cout << "Std Dev: " << stdDev << " ms\n";
+        std::cout << "Min:     " << minMs << " ms\n";
+        std::cout << "Max:     " << maxMs << " ms\n";
+        std::cout << "P95:     " << p95Ms << " ms\n";
+
+        // Per-body-size statistics
+        std::cout << "\n=== Statistics by body size ===\n";
+        for (auto& [bodySize, times] : timesByBodySize) {
+            std::sort(times.begin(), times.end());
+            std::size_t n = times.size();
+            long long sum = 0;
+            for (auto t : times) sum += t;
+            double avg = static_cast<double>(sum) / static_cast<double>(n);
+            long long med = (n % 2 == 1) ? times[n / 2]
+                                          : (times[n / 2 - 1] + times[n / 2]) / 2;
+            std::size_t p95i = static_cast<std::size_t>(std::ceil(0.95 * n)) - 1;
+            long long p95 = times[std::min(p95i, n - 1)];
+
+            std::cout << "Body size " << bodySize
+                      << " (" << n << " rules): "
+                      << "avg=" << avg << " ms, "
+                      << "median=" << med << " ms, "
+                      << "min=" << times.front() << " ms, "
+                      << "max=" << times.back() << " ms, "
+                      << "P95=" << p95 << " ms\n";
+        }
 
         return 0;
     } catch (const std::exception& e) {

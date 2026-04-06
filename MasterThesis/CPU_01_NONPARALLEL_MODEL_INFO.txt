@@ -1,0 +1,367 @@
+================================================================================
+  CPU_01_NONPARALLEL — OPTIMIZED C++ WITH FLAT SORTED INDEXES AND CSR
+================================================================================
+
+1. PURPOSE AND RELATIONSHIP TO REWRITTEN_CPP
+==============================================
+
+CPU_01_nonparallel is the first optimized C++ implementation.  While
+Rewritten_CPP faithfully mirrors the Scala/RDFRules data structures
+(nested hash maps), CPU_01 replaces them with cache-friendly flat sorted
+arrays and CSR (Compressed Sparse Row) indexes.  The algorithm remains
+a backtracking DFS, but every major data structure and the DFS itself
+have been redesigned for maximum CPU performance:
+
+  - Nested hash maps → flat sorted arrays + CSR per predicate
+  - Heap-allocated BindingMap → fixed-size stack-local Env struct
+  - Runtime body size → compile-time template specialization (N=1..8)
+  - Bitmask atom tracking instead of vector<bool>
+
+The algorithmic logic (greedy atom ordering, injective mapping, used-atom
+tracking, early termination) is preserved, so support values match
+Rewritten_CPP exactly.
+
+
+2. FILE STRUCTURE
+==================
+
+The project consists of 6 source files + 1 notebook:
+
+  FinalRule.hpp / FinalRule.cpp
+    Same Term, Atom, Measures, FinalRule structs as Rewritten_CPP.
+    (Shared across all implementations.)
+
+  RdfIndexes.hpp / RdfIndexes.cpp
+    REDESIGNED: replaces nested hash maps with PredIndex (flat sorted
+    arrays + CSR).  This is the key data structure change.
+
+  RuleParser.hpp / RuleParser.cpp
+    Same rule parsing logic as Rewritten_CPP (prefix expansion,
+    variable assignment).
+
+  SupportCounting.hpp / SupportCounting.cpp
+    REDESIGNED: zero-allocation Env struct, template-specialized DFS,
+    bitmask atom tracking.
+
+  main.cpp
+    Entry point: same flow as Rewritten_CPP, with per-rule and
+    per-body-size statistics.
+
+  RunCodeCPU01.ipynb
+    Colab notebook for compiling and running.
+
+
+3. DATA STRUCTURES — KEY CHANGES FROM REWRITTEN_CPP
+=====================================================
+
+3.1 PredIndex (replaces nested hash maps)
+-------------------------------------------
+In Rewritten_CPP, triples were stored as:
+  PSO: unordered_map<int, unordered_map<int, vector<int>>>
+  POS: unordered_map<int, unordered_map<int, vector<int>>>
+
+In CPU_01, each predicate gets a single PredIndex struct with flat arrays:
+
+  struct PredIndex {
+      vector<pair<int,int>> spo;   // sorted (subject, object) pairs
+
+      // CSR for subject -> objects:
+      vector<int> spoKeys;         // sorted unique subjects
+      vector<int> spoOffsets;      // spoKeys.size()+1 entries
+      vector<int> spoVals;         // objects for each subject (sorted)
+
+      // CSR for object -> subjects:
+      vector<int> posKeys;         // sorted unique objects
+      vector<int> posOffsets;
+      vector<int> posVals;         // subjects for each object (sorted)
+  };
+
+The CSR (Compressed Sparse Row) format stores data in three flat arrays:
+  - keys[]:    sorted unique "row" identifiers (subjects or objects)
+  - offsets[]: keys.size()+1 entries; offsets[i]..offsets[i+1] gives
+               the range in vals[] for key keys[i]
+  - vals[]:    the "column" values (objects or subjects), sorted within
+               each group
+
+Example for predicate "worksAt" with triples:
+  (Alice, worksAt, EY), (Alice, worksAt, Google), (Bob, worksAt, EY)
+
+  spoKeys    = [Alice_id, Bob_id]
+  spoOffsets = [0, 2, 3]
+  spoVals    = [EY_id, Google_id, EY_id]
+
+  posKeys    = [EY_id, Google_id]
+  posOffsets = [0, 2, 3]
+  posVals    = [Alice_id, Bob_id, Alice_id]
+
+Why this is faster than Rewritten_CPP:
+  a) Cache locality: flat arrays sit in contiguous memory, so CPU cache
+     lines prefetch the next elements automatically.  Hash maps scatter
+     entries across the heap — every access is a cache miss.
+  b) Binary search on sorted arrays: O(log n) with no pointer chasing.
+     Hash map lookups are O(1) amortized but involve hash computation,
+     potential collisions, and pointer dereference into separate memory.
+  c) No per-query allocation: slicing a range in spoVals is just pointer
+     arithmetic (pointer + count), vs hash map lookup returning a
+     reference to a heap-allocated vector.
+
+Key operations:
+
+  - spoRange(subject, count) -> const int*
+    Binary search spoKeys for the subject, then return a pointer into
+    spoVals + the count of objects.  O(log K) where K = number of unique
+    subjects for this predicate.
+
+  - posRange(object, count) -> const int*
+    Same for the reverse direction (object -> subjects).
+
+  - hasTriple(s, o) -> bool
+    spoRange(s, count) followed by binary search within the object
+    range.  O(log K + log D) where D = degree of subject s.
+
+  - totalPairs() -> int
+    Simply returns spo.size() — the sorted pair array's length.
+
+The build() method constructs the CSR arrays from spo:
+  1. Sort and deduplicate spo pairs
+  2. Scan through sorted pairs, collecting keys and offsets
+  3. Build the reverse (POS) direction the same way
+
+3.2 RdfIndexes (simplified container)
+---------------------------------------
+  class RdfIndexes {
+      unordered_map<int, PredIndex> predIndexes;  // pred -> PredIndex
+      IdMapper mapper;                             // same as Rewritten_CPP
+  };
+
+Only one level of hash map remains (predicate -> PredIndex).  The inner
+two levels (subject -> objects, object -> subjects) are replaced by CSR
+inside PredIndex.
+
+On parseTurtleFile():
+  1. Parse Turtle with raptor2 (same callback as Rewritten_CPP)
+  2. During parsing, push (subject, object) pairs into predIndexes[pred].spo
+  3. After parsing completes, call buildIndexes() which runs
+     PredIndex::build() for every predicate (sort, dedup, build CSR)
+
+3.3 Env (replaces BindingMap — zero-heap-allocation DFS state)
+----------------------------------------------------------------
+In Rewritten_CPP, the BindingMap used:
+  - std::vector<int> hmap   (heap-allocated, resized dynamically)
+  - UsedTriple usedAtoms[8] (fixed array, but embedded in a struct
+    with a heap-allocated vector)
+
+In CPU_01, the Env is entirely stack-local:
+
+  struct Env {
+      int v[MAX_VARS];              // 16 slots, 0 = unbound, constId+1 = bound
+      UsedTriple used[MAX_USED];    // 9 slots (1 head + 8 body)
+      int usedCount;
+  };
+
+  static constexpr int MAX_VARS = 16;
+  static constexpr int MAX_USED = 9;
+
+Key differences from Rewritten_CPP's BindingMap:
+
+  a) Fixed-size stack allocation: no vector, no heap, no resize.
+     sizeof(Env) = 16*4 + 9*12 + 4 = 176 bytes — fits in L1 cache.
+
+  b) Encoding shift: v[varId] stores constId+1 (not constId).
+     0 means unbound.  This avoids the problem Rewritten_CPP had
+     where -1 was the sentinel and entity ID 0 was valid.
+     Scala had the same approach: 0 = unbound because Scala entity
+     IDs started at 1.
+
+  c) init() uses memset(v, 0, sizeof(v)) — a single instruction to
+     clear all 16 variable slots.  Rewritten_CPP had to construct a
+     vector each time.
+
+  d) No injectiveMapping boolean — injectivity is always enforced
+     (all our rules are injective).
+
+Operations:
+  - bind(varId, cid):   v[varId] = cid + 1
+  - isBound(varId):     v[varId] != 0
+  - resolve(varId):     v[varId] - 1   (decode back to constId)
+  - containsConstant(cid): linear scan of v[] for cid+1
+  - pushAtom/popAtom:   stack discipline on used[] array
+
+
+4. THE SUPPORT COUNTING ALGORITHM
+===================================
+
+The algorithm has the same three layers as Rewritten_CPP, but with
+optimized mechanics at every level.
+
+4.1 Outer loop: Head triple enumeration
+-----------------------------------------
+Same logic as Rewritten_CPP: iterate over head triples, bind head
+variables, check body existence.
+
+One optimization: instead of iterating through the nested hash map
+(unordered_map -> unordered_map -> vector), CPU_01 iterates directly
+over the flat sorted spo pair array:
+
+    for (const auto& [s, o] : pi->spo) {
+        processHead(s, o);
+    }
+
+This is a single linear scan through contiguous memory — optimal for
+the CPU prefetcher.  Rewritten_CPP's nested hash map iteration involved
+multiple levels of pointer chasing.
+
+For partially-bound heads (constant subject or object), CPU_01 uses
+spoRange()/posRange() to iterate only over matching triples, avoiding
+unnecessary iteration.
+
+4.2 Template-specialized DFS (compile-time body size)
+-------------------------------------------------------
+The biggest algorithmic optimization: the DFS is a C++ template
+function parameterized by body size N:
+
+    template<int N>
+    bool dfsExists(const Atom* body, uint8_t remaining,
+                   Env& env, int matched) const;
+
+At compile time, the compiler generates separate optimized functions
+for N=1, N=2, ..., N=8.  Benefits:
+
+  a) The compiler knows the loop bound at compile time, enabling
+     full unrolling and register allocation optimization.
+
+  b) The "matched == N" base case is evaluated at compile time — no
+     branch misprediction on the termination check.
+
+  c) All body accesses use raw pointer + index (body[i]) instead of
+     vector::operator[], eliminating bounds-check overhead.
+
+The dispatch function selects the right template:
+
+    switch (n) {
+        case 1: return dfsExists<1>(body, all, env, 0);
+        case 2: return dfsExists<2>(body, all, env, 0);
+        ...
+        case 8: return dfsExists<8>(body, all, env, 0);
+    }
+
+4.3 Bitmask atom tracking
+---------------------------
+Rewritten_CPP used vector<bool> to track which body atoms have been
+matched.  CPU_01 replaces this with a uint8_t bitmask:
+
+    uint8_t remaining   — bit i = 1 means body[i] hasn't been matched yet
+    uint8_t(1) << i     — mask for atom i
+    remaining & ~mask   — clear bit i (mark as matched)
+    remaining & mask    — test if bit i is still available
+
+For up to 8 body atoms, this fits in a single byte.  Checking and
+updating are single bitwise operations — no memory access, no branch.
+
+4.4 Greedy atom selection (same heuristic, faster execution)
+--------------------------------------------------------------
+chooseBestAtom() uses the same scoring heuristic as Rewritten_CPP
+(pick the atom with fewest candidate triples), but operates on the
+bitmask and uses PredIndex's CSR lookups instead of hash map lookups:
+
+  - Both bound:  hasTriple() via CSR binary search
+  - Subject bound: spoRange() count
+  - Object bound:  posRange() count
+  - Neither bound: totalPairs() (flat array length)
+
+4.5 DFS body matching cases
+------------------------------
+The four cases (both bound, subject bound, object bound, neither bound)
+are the same as Rewritten_CPP, but all triple lookups go through CSR:
+
+  Case 1 (both bound):
+    pi->hasTriple(s, o) — binary search spoKeys, then binary search
+    within spoVals range.
+
+  Case 2 (subject bound):
+    pi->spoRange(s, cnt) — returns pointer to sorted object array.
+    Iterate objects, bind/check variables, recurse.
+
+  Case 3 (object bound):
+    pi->posRange(o, cnt) — returns pointer to sorted subject array.
+    Iterate subjects, bind/check variables, recurse.
+
+  Case 4 (neither bound):
+    Iterate pi->spo pairs directly.
+
+In all cases, backtracking saves and restores the raw env.v[varId]
+value — a single integer assignment, no vector copy.
+
+
+5. PERFORMANCE CHARACTERISTICS
+================================
+
+               Rewritten_CPP           CPU_01_nonparallel
+               -------------           ------------------
+Index type     nested hash maps        flat sorted + CSR
+Env size       ~100+ bytes (heap)      176 bytes (stack)
+Env reset      vector constructor      memset (1 instruction)
+Triple lookup  2 hash lookups +        2 binary searches on
+               binary search           contiguous arrays
+DFS            runtime body size       compile-time template N
+Atom bitmask   vector<bool>            uint8_t
+Cache behavior scattered heap          sequential flat arrays
+
+The improvements target three CPU bottlenecks:
+  a) Cache misses: flat arrays keep all data in L1/L2 cache
+  b) Branch misprediction: templates eliminate runtime checks
+  c) Allocation overhead: zero heap allocation during DFS
+
+
+6. WHAT STAYS THE SAME FROM REWRITTEN_CPP
+===========================================
+
+  - FinalRule, Term, Atom, Measures: identical structs
+  - RuleParser: identical parsing logic with prefix expansion
+  - Turtle parsing: same raptor2 callback mechanism
+  - Injective mapping: same constraint enforcement
+  - Used-atom tracking: same duplicate-prevention logic
+  - Greedy atom ordering: same "pick lowest score" heuristic
+  - Output format: same per-rule and timing statistics
+
+
+7. WHAT CHANGES FROM REWRITTEN_CPP
+=====================================
+
+  Data structure layer:
+    OLD: unordered_map<int, unordered_map<int, vector<int>>>
+    NEW: PredIndex with CSR (spoKeys/spoOffsets/spoVals,
+         posKeys/posOffsets/posVals)
+
+  Binding state:
+    OLD: Heap-allocated BindingMap with std::vector<int> hmap
+    NEW: Stack-local Env with fixed int v[16] array, encoding constId+1
+
+  DFS dispatch:
+    OLD: Single bodyExistsRecursive() with runtime body size
+    NEW: Template dfsExists<N>() with compile-time N=1..8
+
+  Atom tracking:
+    OLD: vector<bool> used
+    NEW: uint8_t bitmask
+
+  Head iteration:
+    OLD: Nested hash map iteration (pointer chasing)
+    NEW: Linear scan over sorted pair array (cache-friendly)
+
+
+8. MAIN EXECUTION FLOW
+========================
+
+  1. Parse Turtle file -> push (s,o) pairs into predIndexes[pred].spo
+  2. buildIndexes() -> sort, dedup, build CSR for each predicate
+  3. Parse rules file -> vector of FinalRule
+  4. For each rule:
+     a. Look up PredIndex for head predicate
+     b. Compute headSize = totalPairs()
+     c. Compute headSupport (via spoRange/posRange based on binding)
+     d. Iterate head triples (flat spo array or CSR range)
+     e. For each head triple: init Env, matchHeadAtom, bodyExists
+     f. bodyExists dispatches to dfsExists<N> template
+     g. DFS: chooseBestAtom (bitmask), CSR lookups, recurse
+  5. Print per-rule results and timing statistics

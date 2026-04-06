@@ -1,0 +1,309 @@
+================================================================================
+  CPU_01_PARALLEL — OPENMP-PARALLELIZED OPTIMIZED C++ SUPPORT COUNTING
+================================================================================
+
+1. PURPOSE AND RELATIONSHIP TO CPU_01_NONPARALLEL
+===================================================
+
+CPU_01_parallel is a direct extension of CPU_01_nonparallel.  The entire
+support counting algorithm — PredIndex with CSR arrays, stack-local Env,
+template-specialized DFS<N>, uint8_t bitmask atom tracking — is identical.
+Not a single line of SupportCounting.hpp, SupportCounting.cpp, RdfIndexes,
+FinalRule, or RuleParser was changed.
+
+The only modification is in main.cpp: the sequential for-loop over rules
+is replaced with an OpenMP parallel loop.  This lifts the parallelism
+from "no parallelism" to "rule-level parallelism" — multiple rules are
+evaluated simultaneously on different CPU cores.
+
+
+2. FILE STRUCTURE
+==================
+
+The project has the same 6 source files + 1 notebook as CPU_01_nonparallel:
+
+  FinalRule.hpp / FinalRule.cpp    — IDENTICAL to CPU_01_nonparallel
+  RdfIndexes.hpp / RdfIndexes.cpp  — IDENTICAL to CPU_01_nonparallel
+  RuleParser.hpp / RuleParser.cpp  — IDENTICAL to CPU_01_nonparallel
+  SupportCounting.hpp / .cpp       — IDENTICAL to CPU_01_nonparallel
+  main.cpp                         — MODIFIED (OpenMP additions)
+  RunCodeCPU01.ipynb               — MODIFIED (compilation with -fopenmp)
+
+
+3. WHAT CHANGED IN main.cpp
+=============================
+
+3.1 New includes and OpenMP header
+------------------------------------
+
+    #include <omp.h>
+
+This is the only new header.  It provides omp_get_max_threads() and
+enables the OpenMP pragma directives.
+
+3.2 Thread count reporting
+----------------------------
+
+Before the support counting loop begins, the parallel version prints:
+
+    std::cout << "OpenMP threads: " << omp_get_max_threads() << "\n";
+
+This reports how many threads the OpenMP runtime will use.  On Google
+Colab (2 CPU cores), this is typically 2.  On machines with more cores,
+it scales automatically unless OMP_NUM_THREADS is set.
+
+3.3 The parallel for loop (the core change)
+----------------------------------------------
+
+NONPARALLEL (sequential):
+
+    for (std::size_t i = 0; i < rules.size(); ++i) {
+        auto ruleStart = ...;
+        counter.countSupport(rules[i]);
+        auto ruleEnd = ...;
+        // print results inline
+    }
+
+PARALLEL (OpenMP):
+
+    int nRules = static_cast<int>(rules.size());
+    std::vector<long long> ruleTimes(nRules, 0);
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < nRules; ++i) {
+        auto ruleStart = ...;
+        counter.countSupport(rules[i]);
+        auto ruleEnd = ...;
+        ruleTimes[i] = duration_cast<milliseconds>(ruleEnd - ruleStart).count();
+    }
+
+Key aspects of this parallelization:
+
+  a) Rule-level granularity: each OpenMP thread gets a different rule
+     to evaluate.  This is coarse-grained parallelism — each work unit
+     (one rule) takes milliseconds to seconds, so thread scheduling
+     overhead is negligible.
+
+  b) schedule(dynamic, 1): rules are assigned to threads one at a time
+     on a first-come, first-served basis.  When a thread finishes its
+     current rule, it picks the next unprocessed one.  This is critical
+     because rule evaluation times vary enormously (from <1 ms for
+     1-body rules to 1000+ ms for complex 5-body rules).  Static
+     scheduling would cause load imbalance — some threads finishing
+     early while others are stuck with all the expensive rules.
+
+  c) No shared mutable state: the parallelism is safe without locks
+     because:
+       - The RdfIndexes (PredIndex, CSR arrays, IdMapper) are read-only
+         after construction.  Multiple threads can read simultaneously
+         without any synchronization.
+       - The SupportCounting object holds only a const reference to
+         RdfIndexes — no mutable state.
+       - Each rule writes only to its own FinalRule struct (rules[i]),
+         and no two threads access the same i.  Each thread works on
+         a distinct element of the rules vector.
+       - The Env struct is stack-local (176 bytes), created fresh inside
+         countSupport().  Each thread has its own call stack, so each
+         thread gets its own independent Env.  No heap sharing.
+       - ruleTimes[i] is written by exactly one thread (the one with
+         index i), so no race condition occurs.
+
+  d) int loop variable: OpenMP requires the loop counter to be a signed
+     integer type (not std::size_t), hence the cast to int nRules.
+
+3.4 Deferred output printing
+-------------------------------
+
+In the nonparallel version, results are printed inside the loop as each
+rule finishes.  In the parallel version, printing inside the loop would
+interleave output from multiple threads, producing garbled output.
+
+Instead, rule times are stored in the pre-allocated ruleTimes[] array
+during the parallel loop, and all results are printed sequentially after
+the loop completes:
+
+    // After #pragma omp parallel for finishes:
+    for (int i = 0; i < nRules; ++i) {
+        // print Rule i results using rules[i] and ruleTimes[i]
+    }
+
+3.5 Wall-clock vs CPU-time distinction
+-----------------------------------------
+
+The "Support counting time" in the timing summary now measures wall-clock
+time for the entire parallel region:
+
+    auto supportStart = ...;
+    #pragma omp parallel for ...
+    for (...) { ... }
+    auto supportEnd = ...;
+    supportMs = supportEnd - supportStart;
+
+This is the real elapsed time.  If 2 threads each do 50% of the work at
+the same time, supportMs is roughly half the sequential time.  However,
+the per-rule times (ruleTimes[i]) still measure each individual rule's
+wall-clock duration, so they are unaffected by parallelism.
+
+The sum of all per-rule times (sumRuleMs) will be approximately equal to
+the nonparallel total, because individual rule durations don't change —
+they just execute concurrently.  The ratio sumRuleMs / supportMs
+approximates the effective parallelism (ideally close to the thread count).
+
+
+4. COMPILATION
+================
+
+NONPARALLEL:
+    g++ -std=c++17 main.cpp RdfIndexes.cpp FinalRule.cpp \
+        SupportCounting.cpp RuleParser.cpp \
+        $(pkg-config --cflags --libs raptor2) -O2 -o rdf_rules_test
+
+PARALLEL:
+    g++ -std=c++17 -fopenmp main.cpp RdfIndexes.cpp FinalRule.cpp \
+        SupportCounting.cpp RuleParser.cpp \
+        $(pkg-config --cflags --libs raptor2) -O2 -o rdf_rules_test
+
+The only difference is the -fopenmp flag, which:
+  a) Enables the #pragma omp directives (without -fopenmp they are
+     silently ignored and the code runs sequentially).
+  b) Links the OpenMP runtime library (libgomp on GCC).
+  c) Implicitly adds -pthread for thread creation.
+
+For profiling, the notebook also has:
+    g++ -std=c++17 -fopenmp -pg ...   (adds gprof instrumentation)
+
+
+5. WHY RULE-LEVEL PARALLELISM (NOT HEAD-TRIPLE LEVEL)
+=======================================================
+
+An alternative design would parallelize the inner loop — distributing
+the head triples of a single rule across threads.  This was not chosen
+because:
+
+  a) Rule-level is simpler: zero shared mutable state, no atomic
+     operations, no reduction.  Each thread runs countSupport()
+     independently on a different FinalRule.
+
+  b) Work granularity: with 736 rules in the benchmark, there is
+     ample parallelism at the rule level.  Each rule takes 1–1000+ ms,
+     which is large enough to amortize thread scheduling overhead.
+
+  c) Head-triple parallelism would require an atomic increment for the
+     support counter (shared across threads processing the same rule),
+     and careful handling of the Env struct.  The support variable
+     inside countSupport() would need:
+       #pragma omp atomic
+       ++support;
+     or an omp reduction clause.
+
+  d) Load balance: dynamic scheduling at the rule level naturally
+     balances the workload across cores.  Short rules (1-body,
+     sub-millisecond) and long rules (5-body, seconds) are interleaved
+     across threads as they become available.
+
+  e) On Colab with only 2 cores, rule-level parallelism is sufficient.
+     Head-triple parallelism would add complexity for minimal benefit.
+
+
+6. THREAD SAFETY ANALYSIS
+===========================
+
+The parallelization is safe (data-race-free) because of these properties:
+
+  Read-only shared data (no synchronization needed):
+    - RdfIndexes: all PredIndex structs with CSR arrays are immutable
+      after buildIndexes() completes.
+    - SupportCounting: holds only "const RdfIndexes&" — no mutable fields.
+    - rules[i].body, rules[i].head: rule structure is read-only.
+
+  Thread-private data (no sharing):
+    - Env struct: created on each thread's stack inside countSupport().
+    - Local variables in dfsExists<N>: all on the thread's stack.
+    - Loop index i: private by OpenMP default for parallel for.
+
+  Disjoint write access (no race):
+    - rules[i].measures.support: written only by the thread with index i.
+    - rules[i].measures.headCoverage: same.
+    - rules[i].measures.headSupport: same.
+    - rules[i].measures.headSize: same.
+    - ruleTimes[i]: same.
+
+No locks, no atomics, no critical sections are needed.
+
+
+7. PERFORMANCE CHARACTERISTICS
+=================================
+
+              CPU_01_nonparallel     CPU_01_parallel
+              ------------------     ---------------
+Algorithm     identical DFS          identical DFS
+Data structs  PredIndex + CSR        PredIndex + CSR (same)
+Env           stack-local (176B)     stack-local per thread
+DFS template  dfsExists<N>           dfsExists<N> (same)
+Bitmask       uint8_t                uint8_t (same)
+Rule loop     sequential for         #pragma omp parallel for
+Scheduling    N/A                    dynamic, chunk=1
+Thread count  1                      omp_get_max_threads()
+Per-rule time same                   same (individual rule unchanged)
+Wall-clock    sum of per-rule times  ≈ sum / num_threads (ideal)
+Scalability   N/A                    near-linear with core count
+Overhead      none                   negligible (thread scheduling)
+
+The speedup from parallelism depends on the number of CPU cores and the
+distribution of rule evaluation times.  With 2 Colab cores, the expected
+speedup is close to 2x  for the support counting phase.  Indexing and
+rule parsing remain sequential (they run before the parallel loop).
+
+On machines with more cores, the speedup scales approximately linearly
+because there is no shared mutable state and the 736 rules provide
+sufficient parallelism to keep all cores busy.
+
+
+8. WHAT STAYS THE SAME FROM CPU_01_NONPARALLEL
+=================================================
+
+Everything except main.cpp:
+
+  - PredIndex with CSR flat sorted arrays (spoKeys/spoOffsets/spoVals)
+  - Stack-local Env struct (176 bytes, zero heap allocation)
+  - Template-specialized dfsExists<N> (N=1..8)
+  - uint8_t bitmask for atom tracking
+  - Greedy atom selection (chooseBestAtom with CSR-based scoring)
+  - Four DFS body matching cases (both bound, subject bound, etc.)
+  - Injective mapping enforcement
+  - Used-atom tracking with stack discipline
+  - Turtle parsing with raptor2
+  - Rule parsing with prefix expansion
+  - FinalRule, Term, Atom, Measures structs
+
+
+9. WHAT CHANGES FROM CPU_01_NONPARALLEL
+=========================================
+
+  main.cpp only:
+    ADDED:   #include <omp.h>
+    ADDED:   omp_get_max_threads() printout
+    CHANGED: sequential for-loop → #pragma omp parallel for schedule(dynamic,1)
+    CHANGED: per-rule timing stored in pre-allocated array (not printed inline)
+    CHANGED: results printed sequentially after parallel region completes
+
+  Compilation:
+    ADDED:   -fopenmp flag
+
+  Nothing else changed.  The SupportCounting algorithm, data structures,
+  and all other source files are byte-for-byte identical.
+
+
+10. MAIN EXECUTION FLOW
+=========================
+
+  1. Parse Turtle file → build CSR indexes          (sequential, same)
+  2. Parse rules file → vector of FinalRule          (sequential, same)
+  3. Print thread count: omp_get_max_threads()       (NEW)
+  4. OpenMP parallel for over rules[0..nRules-1]:    (CHANGED)
+     - Each thread picks rule i (dynamic scheduling)
+     - countSupport(rules[i]) runs the full DFS algorithm
+     - Thread stores wall-clock time in ruleTimes[i]
+     - Multiple rules execute simultaneously on different cores
+  5. Sequential result printing (after parallel region)
+  6. Print timing summary and per-body-size statistics (same)

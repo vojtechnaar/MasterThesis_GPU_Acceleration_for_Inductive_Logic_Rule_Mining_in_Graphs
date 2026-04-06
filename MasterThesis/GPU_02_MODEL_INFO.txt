@@ -1,0 +1,449 @@
+================================================================================
+  GPU_02 — SPARSE-MATRIX FUSED CHAIN KERNEL (TensorLog / RLvLR APPROACH)
+================================================================================
+
+1. PURPOSE AND THEORETICAL MOTIVATION
+========================================
+
+GPU_02 implements the sparse-matrix approach to support counting,
+inspired by the TensorLog and RLvLR (Reinforcement Learning via
+Learned Value Representations) literature.
+
+The key insight from this literature:
+
+  For a chain rule   q1(x,z1) ∧ q2(z1,z2) ∧ ... ∧ qn(zn-1,y) ⇒ p(x,y)
+
+  support = nnz( M_q1 × M_q2 × ... × M_qn  .*  M_head )
+
+  where:
+    - Each predicate qi is stored as a sparse matrix M_qi
+      (nEntities × nEntities) in CSR format
+    - M_head is the head predicate's sparse matrix
+    - × is sparse matrix multiplication (SpGEMM)
+    - .* is element-wise intersection (Hadamard product)
+    - nnz counts the non-zero entries in the result
+
+This reformulates the DFS body-matching problem as linear algebra
+over sparse matrices, which is a well-studied computational primitive
+on GPUs (cuSPARSE, cuBLAS, etc.).
+
+However, GPU_02's history shows that the direct SpGEMM approach fails
+in practice due to memory constraints:
+
+  Phase 1: Attempted cuSPARSE SpGEMM (M_q1 × M_q2 × ... × M_qn).
+           Result: CUDA error 11 (cudaErrorInvalidValue) / OOM.
+           The intermediate product matrices are dense because
+           knowledge graphs have high connectivity — a 500K×500K
+           matrix with millions of non-zeros quickly exceeds 15GB
+           GPU memory.
+
+  Phase 2: Replaced SpGEMM with a fused kernel that checks the chain
+           connectivity per head triple without materializing any
+           intermediate matrix.  This is the final working version.
+
+The fused kernel is algorithmically equivalent to the matrix product
+intersection, but uses O(1) extra memory (no intermediate matrices).
+
+
+2. FILE STRUCTURE
+==================
+
+  FinalRule.hpp / FinalRule.cpp    — IDENTICAL to CPU_01
+  RdfIndexes.hpp / RdfIndexes.cpp  — IDENTICAL to CPU_01
+  RuleParser.hpp / RuleParser.cpp  — IDENTICAL to CPU_01
+  gpu_common.cuh      — CUDA_OK macro, Clock (no algorithm constants)
+  gpu_sparse.cuh      — DevCSR, build/upload CSR, fused kernel, CompactHead
+  bench_gpu.cu        — main(): chain extraction, atom classification, launch
+  RunCodeGPU02.ipynb  — Colab notebook
+
+Compilation:
+    nvcc -O3 -std=c++17 bench_gpu.cu FinalRule.cpp RdfIndexes.cpp \
+         RuleParser.cpp $(pkg-config --cflags --libs raptor2) -o bench_gpu
+
+
+3. DATA STRUCTURES
+====================
+
+3.1 DevCSR (per-predicate CSR matrix)
+---------------------------------------
+  struct DevCSR {
+      int     rows, cols;
+      int64_t nnz;
+      int*    d_rowPtr;     // rows+1 entries (device)
+      int*    d_colInd;     // nnz entries, sorted within each row (device)
+      bool    ownsMemory;
+  };
+
+Each predicate gets two DevCSR matrices:
+  - spo: subject → object  (adjacency matrix M)
+  - pos: object → subject  (transpose matrix M^T)
+
+These are standard CSR (Compressed Sparse Row) matrices of dimension
+nEntities × nEntities, where nEntities ≈ 500K.  The rowPtr array has
+nEntities+1 entries (~2MB), and colInd has nnz entries.
+
+Row access is O(1):
+  rowPtr[entity] and rowPtr[entity+1] give the range in colInd[]
+  for that entity's outgoing edges.
+
+This is the fundamental data structure difference from GPU_01 (which
+uses sorted int2 arrays with O(log |P|) binary search).
+
+3.2 PredCSR (per-predicate pair of CSR matrices)
+---------------------------------------------------
+  struct PredCSR {
+      DevCSR spo;   // M: subject→object
+      DevCSR pos;   // M^T: object→subject
+  };
+
+3.3 build_pred_csr() — construction from PredIndex
+------------------------------------------------------
+  Input:  PredIndex.spo (sorted pair<int,int>), nEntities, transpose flag
+  Output: DevCSR on GPU
+
+  Steps:
+    1. If transpose: swap (s,o) → (o,s) for each pair
+    2. Sort and deduplicate
+    3. Build host CSR arrays (rowPtr, colInd)
+    4. cudaMalloc + cudaMemcpy to GPU
+
+  Memory usage per predicate:
+    rowPtr: (nEntities + 1) × 4 bytes → ~2 MB for 500K entities
+    colInd: nnz × 4 bytes
+
+  Total GPU memory for all predicates:
+    #predicates × 2 directions × 2 MB (rowPtr) + total nnz × 4 bytes
+
+3.4 CompactHead (flat head triple array)
+-------------------------------------------
+  struct CompactHead {
+      int2* d_pairs;   // device pointer to (subject, object) pairs
+      int   nPairs;    // number of pairs
+  };
+
+Instead of iterating over the CSR's rowPtr/colInd in the kernel,
+head triples are pre-extracted into a flat int2 array.  This ensures
+each GPU thread gets exactly one (s,o) pair with O(1) indexing:
+
+    thread i → headPairs[i] = (s, o)
+
+Without compaction, the kernel would need to find which row and which
+column index corresponds to a given thread ID — a cumbersome binary
+search operation on rowPtr.
+
+build_compact_head(DevCSR):
+  1. Download rowPtr and colInd from GPU to host
+  2. Expand into (s, o) pair array
+  3. Upload back to GPU
+
+3.5 DevChainCSR / DevExtraCheck (kernel parameters)
+------------------------------------------------------
+
+  struct DevChainCSR {
+      const int* rp;   // rowPtr
+      const int* ci;   // colInd
+  };
+
+A lightweight struct with just two device pointers, used to pass
+chain atoms and filter atoms to the kernel.
+
+  struct DevExtraCheck {
+      const int* rp;
+      const int* ci;
+      int rowSrc;       // 0=s, 1=o, 2=const
+      int colSrc;       // 0=s, 1=o, 2=const, 3=free
+      int rowConst;     // entity ID if rowSrc==2
+      int colConst;     // entity ID if colSrc==2
+  };
+
+For non-chain body atoms that reference constants or free variables
+(not just hS and hO), DevExtraCheck encodes how to resolve the row
+and column from the head triple.
+
+  rowSrc/colSrc encoding:
+    0 = use head subject (s from the head triple)
+    1 = use head object (o from the head triple)
+    2 = constant entity ID (stored in rowConst/colConst)
+    3 = free variable (only check that the row is non-empty)
+
+
+4. CHAIN EXTRACTION
+======================
+
+GPU_02's unique algorithmic contribution is decomposing each rule into
+three categories of body atoms: chain, filter, and extra.
+
+4.1 The variable graph
+------------------------
+Each body atom q(x, y) creates an edge between variable x and variable y.
+The head atom p(hS, hO) defines the source (hS) and target (hO).
+
+A "chain" is a path from hS to hO through body atoms:
+  hS →[q1]→ z1 →[q2]→ z2 →[q3]→ ... →[qn]→ hO
+
+4.2 find_chain_dfs()
+-----------------------
+Performs a DFS on the variable graph (≤ 8 nodes) to find a path
+from hS to hO.  Each edge records:
+
+  struct ChainStep {
+      int pred;       // predicate ID
+      bool transpose; // true = POS matrix, false = SPO matrix
+  };
+
+If atom q(x,y) is traversed forward (x→y), use SPO matrix.
+If traversed backward (y→x), use POS matrix (transpose).
+
+4.3 Remaining atom classification
+------------------------------------
+After extracting the chain and marking used atoms, the remaining
+body atoms are classified:
+
+  Filter atoms: both endpoints are hS and hO.
+    Example: q(hS, hO) with the same variables as the head.
+    Check: does the filter predicate's CSR have an entry at (s,o)?
+    → bsearch_row(filter.rp, filter.ci, s, o)
+
+  Extra atoms: one or both endpoints are constants or free variables.
+    Example: q(hS, <constant>), q(<constant>, hO), q(z, hO) where
+    z is a variable not on the chain path.
+
+    Using the rowSrc/colSrc encoding:
+      q(hS, <constant>):   rowSrc=0, colSrc=2, colConst=entityID
+      q(<constant>, hO):   rowSrc=2, colSrc=1, rowConst=entityID
+      q(z, hO):            rowSrc=3 (free), colSrc=1 → check row non-empty
+
+4.4 Handling rules without a complete chain
+----------------------------------------------
+If no path from hS to hO exists in the variable graph (e.g., star
+patterns), the chain is empty and all body atoms become filters or
+extras.  The kernel still works: with chainLen=0, it only evaluates
+filters and extras for each head triple.
+
+
+5. THE FUSED CHAIN KERNEL
+============================
+
+5.1 Kernel signature
+-----------------------
+  __global__ void fused_support_kernel(
+      const int2*          headPairs,     // compact (s,o) array
+      int                  nPairs,
+      int                  chainLen,      // number of chain steps
+      const DevChainCSR*   chain,         // chain CSR pointers
+      int                  numFilters,    // number of filter atoms
+      const DevChainCSR*   filters,       // filter CSR pointers
+      int                  numExtras,     // number of extra checks
+      const DevExtraCheck* extras,        // extra check descriptors
+      unsigned long long*  out);          // global support counter
+
+5.2 Per-thread logic
+-----------------------
+Each thread processes one head triple (s, o):
+
+  1. Chain check: does the body chain connect s → o?
+     Calls chain_check(s, o, 0, chainLen, chain) — a recursive
+     function that traverses the chain matrices one by one.
+
+  2. Filter check: for each filter atom, verify that the filter
+     predicate's CSR has an entry at row=s, col=o.
+     → bsearch_row(filter.rp, filter.ci, s, o)
+
+  3. Extra check: for each extra atom, resolve row and col from
+     the head triple's s and o (or constants), then check.
+     → eval_extra(extras[e], s, o)
+
+  4. If all checks pass → increment local counter.
+
+  5. Warp reduction + atomicAdd (same as GPU_01).
+
+5.3 chain_check() — recursive chain traversal
+-------------------------------------------------
+  __device__ bool chain_check(
+      int current, int target,
+      int depth, int chainLen,
+      const DevChainCSR* chain);
+
+For depth == chainLen-1 (last chain step):
+  Direct binary search: does chain[depth] have an entry (current → target)?
+
+For depth < chainLen-1:
+  Iterate over chain[depth]'s row for 'current':
+    For each neighbor z:
+      Recursively check chain_check(z, target, depth+1, chainLen, chain)
+
+This is a DFS on the chain, but WITHOUT variable binding or injective
+mapping checks.  The chain approach assumes all intermediate variables
+are existentially quantified — it only checks reachability from s to o
+through the chain, not specific bindings.
+
+IMPORTANT LIMITATION: this means GPU_02 does NOT enforce injective
+mapping on chain intermediate variables.  If a chain has z1 = z2 in
+some matching path, GPU_02 would count it while GPU_01 would not.  In
+practice, this rarely matters because injective violations are rare in
+real knowledge graphs, but it is a semantic difference.
+
+5.4 bsearch_row() and eval_extra()
+-------------------------------------
+  bsearch_row(rp, ci, row, target): binary search colInd in the range
+  [rp[row], rp[row+1]) for target.  Uses __ldg for all reads.
+
+  row_nonempty(rp, row): checks if rp[row+1] > rp[row] (any entries
+  exist for this row).  Used for free variable checks.
+
+  eval_extra(ec, s, o): dispatches based on rowSrc/colSrc encoding.
+
+
+6. HOST WRAPPER: fused_chain_support()
+=========================================
+
+Orchestrates the kernel launch:
+
+  1. Build DevChainCSR arrays from chain matrix pointers
+  2. Build DevChainCSR arrays from filter matrix pointers
+  3. Allocate and upload DevExtraCheck array
+  4. Allocate d_cnt (global counter), memset to 0
+  5. Launch kernel: blk=256, grd=min(ceil(nPairs/256), 2048)
+  6. cudaDeviceSynchronize()
+  7. Read d_cnt back to host
+  8. Free temporary device allocations
+
+Note: unlike GPU_01 (which uses cudaEventRecord for timing), GPU_02
+uses cudaDeviceSynchronize + host chrono timing.  This includes the
+overhead of kernel launch and small device-side allocations in the
+timing, making GPU_02's per-rule times slightly higher than pure
+kernel execution time.
+
+
+7. EXECUTION FLOW
+===================
+
+  1. Parse Turtle file with raptor2 → RdfIndexes
+  2. build_all_csr() → DevCSR (spo + pos) per predicate
+  3. Parse rules → vector of FinalRule
+  4. convert_rule() → GpuRule per rule
+  5. For each rule:
+     a. Compute headSize, headSupport (via PredIndex, same as CPU)
+     b. extract_chain() → chain steps + filter steps + extra checks
+     c. Check all required predicates exist in CSR index
+     d. Build or reuse CompactHead for head predicate
+     e. Collect chain/filter/extra CSR pointers
+     f. fused_chain_support() → launch kernel, get support count
+     g. Set rule measures
+  6. Print results and timing statistics
+
+
+8. COMPARISON WITH GPU_01
+============================
+
+               GPU_01                     GPU_02
+               ------                     ------
+Data format    sorted int2 per pred       CSR per pred (nEntities×nEntities)
+Row access     O(log |P|) binary search   O(1) via rowPtr
+GPU memory     pairs only (~compact)      rowPtr overhead (~2MB/pred/dir)
+Algorithm      DFS with variable binding  chain traversal + filter/extra checks
+Injective      full injective mapping     NOT enforced on chain intermediates
+Atom ordering  greedy maxfan              chain extraction (hS→hO path)
+Kernel type    standard + warp-coop       single fused kernel only
+__constant__   AtomGPU descriptors        not used (chain/filter/extra via args)
+Template DFS   dfs<L,N> compile-time      chain_check runtime recursion
+Head triples   from sorted int2 array     from CompactHead (pre-extracted)
+Non-chain      N/A (all atoms via DFS)    filter atoms + DevExtraCheck
+Per-rule alloc zero (all pre-uploaded)     per-rule cudaMalloc for chain/filter
+
+
+9. WHY GPU_02 IS TYPICALLY SLOWER THAN GPU_01
+=================================================
+
+Despite the O(1) row access advantage, GPU_02 is typically slower:
+
+  a) No template specialization: chain_check uses runtime recursion
+     with depth as a parameter, preventing compile-time unrolling.
+     GPU_01's dfs<L,N> generates fully specialized code for each body size.
+
+  b) No __constant__ memory: chain/filter/extra descriptors are passed
+     as kernel arguments via global memory pointers, not broadcast via
+     __constant__.
+
+  c) Per-rule allocations: each rule's kernel launch involves cudaMalloc
+     + cudaMemcpy for chain/filter/extra arrays, then cudaFree after.
+     GPU_01 only does a single cudaMemcpyToSymbol per rule.
+
+  d) No warp-cooperative kernel: all head triples use the standard
+     1-thread-per-triple kernel.  High-fanout first atoms don't benefit
+     from 32-lane parallelism.
+
+  e) No injective mapping: this sounds like it should be faster (fewer
+     checks), but it's a semantic difference, not a performance one.
+     The chain_check traversal is inherently less efficient than the
+     DFS because it doesn't prune via variable bindings.
+
+  f) Conceptual mismatch: the sparse matrix approach is designed for
+     the product M_q1 × M_q2 × ... × M_qn, not for per-triple DFS.
+     Once the SpGEMM product was abandoned (OOM), the fused kernel
+     converges to the same per-triple DFS as GPU_01 but with worse
+     memory access patterns and no compile-time specialization.
+
+
+10. SIGNIFICANCE AS A NEGATIVE RESULT
+========================================
+
+GPU_02 is valuable for the thesis as a negative experimental result:
+
+  a) It demonstrates that the TensorLog/RLvLR sparse matrix approach
+     (SpGEMM chain product) does NOT scale to real knowledge graphs
+     with 500K+ entities due to intermediate matrix explosion.
+
+  b) The fallback (fused kernel without SpGEMM) shows that once the
+     matrix multiplication idea is abandoned, the remaining algorithm
+     converges to a less-optimized version of the DFS approach.
+
+  c) The CSR data structure prerequisite (O(1) row access) survives
+     and is reused in GPU_03, but the SpGEMM idea (the paper's actual
+     novel contribution) was discarded.
+
+  d) This is (to our knowledge) the first empirical evidence that
+     GPU-accelerated SpGEMM for discrete rule support counting fails
+     at scale, which is informative for future research in this area.
+
+
+11. WHAT STAYS THE SAME FROM GPU_01
+======================================
+
+  - FinalRule, RdfIndexes, RuleParser: identical
+  - convert_rule(): similar (GPU_02 adds sConst/oConst tracking)
+  - Per-rule sequential processing
+  - Binary search with __ldg for CSR column lookups
+  - Warp reduction + atomicAdd for support counting
+  - Output format: same per-rule and timing statistics
+
+
+12. WHAT CHANGES FROM GPU_01
+===============================
+
+  Data structure:
+    OLD: sorted int2 arrays per predicate
+    NEW: CSR matrices (nEntities × nEntities) per predicate
+
+  Algorithm:
+    OLD: template DFS<L,N> with full variable binding
+    NEW: chain extraction + fused kernel (chain_check + filters + extras)
+
+  atom descriptors:
+    OLD: AtomGPU in __constant__ memory
+    NEW: DevChainCSR/DevExtraCheck in global memory (per-rule allocation)
+
+  Kernel types:
+    OLD: standard + warp-cooperative
+    NEW: single fused_support_kernel only
+
+  Non-chain atoms:
+    NEW: filter atoms (hS→hO check) + DevExtraCheck (constants, free vars)
+
+  Head triples:
+    OLD: iterate device-side sorted int2 array
+    NEW: CompactHead (pre-extracted (s,o) pairs from CSR)
+
+  Injective mapping:
+    OLD: enforced on all variables
+    NEW: NOT enforced on chain intermediate variables

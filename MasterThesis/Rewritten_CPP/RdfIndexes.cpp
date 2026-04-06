@@ -1,5 +1,6 @@
 #include "RdfIndexes.hpp"
 
+#include <algorithm>
 #include <iostream>
 
 #include <raptor2.h>
@@ -33,9 +34,8 @@ void RdfIndexes::addTriple(const std::string& s, const std::string& p, const std
     const int pid = mapper.getOrCreateId(p);
     const int oid = mapper.getOrCreateId(o);
 
-    triples.push_back({sid, pid, oid});
-    pso[pid][sid].insert(oid);
-    pos[pid][oid].insert(sid);
+    pso[pid][sid].push_back(oid);
+    pos[pid][oid].push_back(sid);
 }
 
 bool RdfIndexes::hasTriple(int s, int p, int o) const {
@@ -45,10 +45,10 @@ bool RdfIndexes::hasTriple(int s, int p, int o) const {
     auto sit = pit->second.find(s);
     if (sit == pit->second.end()) return false;
 
-    return sit->second.find(o) != sit->second.end();
+    return std::binary_search(sit->second.begin(), sit->second.end(), o);
 }
 
-const RdfIndexes::IntSet* RdfIndexes::getObjects(int predicate, int subject) const {
+const RdfIndexes::IntVec* RdfIndexes::getObjects(int predicate, int subject) const {
     auto pit = pso.find(predicate);
     if (pit == pso.end()) return nullptr;
 
@@ -58,7 +58,7 @@ const RdfIndexes::IntSet* RdfIndexes::getObjects(int predicate, int subject) con
     return &sit->second;
 }
 
-const RdfIndexes::IntSet* RdfIndexes::getSubjects(int predicate, int object) const {
+const RdfIndexes::IntVec* RdfIndexes::getSubjects(int predicate, int object) const {
     auto pit = pos.find(predicate);
     if (pit == pos.end()) return nullptr;
 
@@ -69,7 +69,13 @@ const RdfIndexes::IntSet* RdfIndexes::getSubjects(int predicate, int object) con
 }
 
 void RdfIndexes::printStats() const {
-    std::cout << "Triples: " << triples.size() << "\n";
+    std::size_t tripleCount = 0;
+    for (const auto& [pred, subjMap] : pso) {
+        for (const auto& [subj, objSet] : subjMap) {
+            tripleCount += objSet.size();
+        }
+    }
+    std::cout << "Triples: " << tripleCount << "\n";
     std::cout << "Unique RDF terms: " << mapper.size() << "\n";
     std::cout << "Predicates in PSO: " << pso.size() << "\n";
     std::cout << "Predicates in POS: " << pos.size() << "\n";
@@ -171,5 +177,29 @@ bool RdfIndexes::parseTurtleFile(const std::string& filePath) {
         return false;
     }
 
+    finalize();
     return true;
+}
+
+void RdfIndexes::finalize() {
+    for (auto& [pred, subjMap] : pso) {
+        for (auto& [subj, vec] : subjMap) {
+            std::sort(vec.begin(), vec.end());
+            vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+        }
+    }
+    for (auto& [pred, objMap] : pos) {
+        for (auto& [obj, vec] : objMap) {
+            std::sort(vec.begin(), vec.end());
+            vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+        }
+    }
+    // Cache pair counts per predicate so scoreAtom doesn't re-scan
+    for (const auto& [pred, subjMap] : pso) {
+        int count = 0;
+        for (const auto& [subj, vec] : subjMap) {
+            count += static_cast<int>(vec.size());
+        }
+        pairCount[pred] = count;
+    }
 }

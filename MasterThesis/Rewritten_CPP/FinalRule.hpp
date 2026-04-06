@@ -1,8 +1,6 @@
 #pragma once
 
 #include <vector>
-#include <string>
-#include <cstdint>
 
 enum class TermType {
     Variable,
@@ -34,9 +32,6 @@ struct Measures {
     int headSize = 0;
     int headSupport = 0;
     double headCoverage = 0.0;
-
-    Measures() = default;
-    Measures(int supp, int hSize, int hSupp, double hCov);
 };
 
 struct FinalRule {
@@ -46,8 +41,6 @@ struct FinalRule {
 
     FinalRule() = default;
     FinalRule(const Atom& headAtom, const std::vector<Atom>& bodyAtoms);
-    FinalRule(const Atom& headAtom, const std::vector<Atom>& bodyAtoms, const Measures& m);
 
     void setMeasures(int support, int headSize, int headSupport);
-    std::size_t bodySize() const;
 };

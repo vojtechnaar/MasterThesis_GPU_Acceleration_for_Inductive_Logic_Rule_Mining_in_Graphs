@@ -1,15 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include <unordered_set>
-
-struct Triple {
-    int s = -1;
-    int p = -1;
-    int o = -1;
-};
 
 class IdMapper {
 public:
@@ -25,9 +19,9 @@ private:
 
 class RdfIndexes {
 public:
-    using IntSet = std::unordered_set<int>;
-    using SubjectToObjects = std::unordered_map<int, IntSet>;
-    using ObjectToSubjects = std::unordered_map<int, IntSet>;
+    using IntVec = std::vector<int>;  // sorted, deduplicated after loading
+    using SubjectToObjects = std::unordered_map<int, IntVec>;
+    using ObjectToSubjects = std::unordered_map<int, IntVec>;
 
     // PSO: predicate -> subject -> {objects}
     std::unordered_map<int, SubjectToObjects> pso;
@@ -35,15 +29,20 @@ public:
     // POS: predicate -> object -> {subjects}
     std::unordered_map<int, ObjectToSubjects> pos;
 
-    std::vector<Triple> triples;
     IdMapper mapper;
 
     void addTriple(const std::string& s, const std::string& p, const std::string& o);
     bool parseTurtleFile(const std::string& filePath);
 
     bool hasTriple(int s, int p, int o) const;
-    const IntSet* getObjects(int predicate, int subject) const;
-    const IntSet* getSubjects(int predicate, int object) const;
+    const IntVec* getObjects(int predicate, int subject) const;
+    const IntVec* getSubjects(int predicate, int object) const;
+
+    // Sort and deduplicate all IntVecs after loading is complete
+    void finalize();
+
+    // Cached pair count per predicate (populated by finalize())
+    std::unordered_map<int, int> pairCount;
 
     void printStats() const;
 };
